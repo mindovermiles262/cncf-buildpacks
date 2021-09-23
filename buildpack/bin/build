@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+echo "---> Ruby Buildpack"
+
+# GET ARGS
+layersdir=$1
+plan=$3
+
+# CREATE LAYER DIRECTORY
+rubylayer="$layersdir"/ruby
+mkdir -p "$rubylayer"
+
+#############################
+# DOWNLOAD AND INSTALL RUBY #
+#############################
+local_ruby_version=$($rubylayer/bin/ruby -v || echo "NONE" )
+remote_ruby_version=$(cat "$layersdir/ruby.toml" | yj -t | jq -r .metadata.installed_version 2>/dev/null || echo 'DOES_NOT_EXIST')
+remote_ruby_version_short=$(cat "$layersdir/ruby.toml" | yj -t | jq -r .metadata.short_version 2>/dev/null || echo 'DOES_NOT_EXIST')
+wanted_ruby_version=$(cat "$plan" | yj -t | jq -r '.entries[] | select(.name == "ruby") | .metadata.version')
+
+# echo "---> Local:  $local_ruby_version"
+# echo "---> Remote: $remote_ruby_version"
+# echo "---> Stored: $remote_ruby_version_short"
+# echo "---> Wanted: $wanted_ruby_version"
+
+# Download new Ruby runtime if ruby version has changed or user changes `.ruby-version` file
+if [[ "$local_ruby_version" == "$remote_ruby_version" && "$remote_ruby_version_short" == "$wanted_ruby_version" ]]; 
+then
+  echo "---> Reusing Ruby Layer"
+else
+  echo "---> Downloading and extracting Ruby $wanted_ruby_version"
+  ruby_url=https://s3-external-1.amazonaws.com/heroku-buildpack-ruby/heroku-18/ruby-$wanted_ruby_version.tgz
+  wget -q -O - "$ruby_url" | tar -xzf - -C "$rubylayer"
+fi
+
+export PATH="$rubylayer"/bin:$PATH
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}"$rubylayer/lib"
+
+installed_ruby_version=$(ruby -v)
+# Cache ruby layer
+cat > "$layersdir/ruby.toml" <<EOL
+launch = true
+cache = true
+
+[metadata]
+short_version = "$wanted_ruby_version"
+installed_version = "$installed_ruby_version"
+EOL
+
+###################
+# INSTALL BUNDLER #
+###################
+echo "---> Installing bundler"
+gem install bundler --no-ri --no-rdoc
+
+################
+# INSTALL GEMS #
+################
+
+# Compares previous Gemfile.lock checksum to the current Gemfile.lock
+bundlerlayer="$layersdir/bundler"
+local_bundler_checksum=$((sha256sum Gemfile.lock >/dev/null 2>&1 || echo 'DOES_NOT_EXIST') | cut -d ' ' -f 1)
+remote_bundler_checksum=$(cat "$layersdir/bundler.toml" | yj -t | jq -r .metadata.checksum 2>/dev/null || echo 'DOES_NOT_EXIST')
+
+if [[ -f Gemfile.lock && $local_bundler_checksum == $remote_bundler_checksum ]] ; then
+    # Determine if no gem dependencies have changed, so it can reuse existing gems without running bundle install
+    echo "---> Reusing gems"
+    bundle config --local path "$bundlerlayer" >/dev/null
+    bundle config --local bin "$bundlerlayer/bin" >/dev/null
+else
+    # Determine if there has been a gem dependency change and install new gems to the bundler layer; re-using existing and un-changed gems
+    echo "---> Installing gems"
+    mkdir -p "$bundlerlayer"
+    cat > "$layersdir/bundler.toml" <<EOL
+cache = true
+launch = true
+
+[metadata]
+checksum = "$local_bundler_checksum"
+EOL
+    bundle config set --local path "$bundlerlayer" && bundle install && bundle binstubs --all --path "$bundlerlayer/bin"
+
+fi
+
+#############################
+# SET DEFAULT START COMMAND #
+#############################
+cat > "$layersdir/launch.toml" <<EOL
+# our web process
+[[processes]]
+type = "web"
+command = "bundle exec ruby app.rb"
+
+# our worker process
+[[processes]]
+type = "worker"
+command = "bundle exec ruby worker.rb"
+EOL
+
+#########################
+# ADD BILL OF MATERIALS #
+#########################
+cat >> "$layersdir/launch.toml" <<EOL
+[[bom]]
+name = "ruby"
+[bom.metadata]
+version = "$ruby_version"
+EOL
